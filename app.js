@@ -6,6 +6,9 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Import the vidlink module
+const vidlinkModule = require('./vidlink.js');
+
 // CORS Middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -219,14 +222,20 @@ async function ensureDir(dir) {
 async function downloadSubtitle(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Subtitle download failed: ${res.status}`);
-  const buffer = await res.arrayBuffer();
-  return Buffer.from(buffer).toString('utf8');
-}
-
-function srtToVtt(srtContent) {
-  let vtt = 'WEBVTT\n\n';
-  vtt += srtContent.replace(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/g, '$1:$2:$3.$4');
-  return vtt;
+  
+  // Get content type from response headers
+  const contentType = res.headers.get('content-type') || '';
+  let content = await res.text();
+  
+  // Clean up any encoding issues
+  content = content.trim();
+  
+  console.log(`Downloaded subtitle: ${url}`);
+  console.log(`Content type: ${contentType}`);
+  console.log(`First 100 chars: ${content.substring(0, 100)}...`);
+  console.log(`Is VTT? ${content.startsWith('WEBVTT')}`);
+  
+  return content;
 }
 
 async function translateTextWithQueue(text, sourceLang = 'en', targetLang = 'ckb') {
@@ -323,12 +332,34 @@ function reconstructSubtitle(blocks) {
 }
 
 async function translateSubtitle(content, processId, targetLang) {
-  const blocks = parseSubtitleContent(content);
-  const textLines = blocks.flatMap(block => block.text).filter(text => text.trim());
-  
   const languageName = SUPPORTED_LANGUAGES[targetLang]?.name || targetLang;
+  
+  // Check if content is already in VTT format
+  const isVTT = content.trim().startsWith('WEBVTT');
+  
+  let blocks;
+  let textLines;
+  
+  if (isVTT) {
+    console.log(`Detected VTT format, parsing WebVTT content...`);
+    // Parse VTT format
+    blocks = parseVTTContent(content);
+  } else {
+    console.log(`Detected SRT format, parsing SRT content...`);
+    // Parse SRT format
+    blocks = parseSubtitleContent(content);
+  }
+  
+  textLines = blocks.flatMap(block => block.text).filter(text => text.trim());
+  
   console.log(`Translating ${textLines.length} subtitle lines to ${languageName}...`);
   updateProcessStatus(processId, 'translating', `Translating ${textLines.length} subtitle lines to ${languageName}...`, 40);
+  
+  if (textLines.length === 0) {
+    console.warn(`No text lines found in subtitle. Returning original content.`);
+    updateProcessStatus(processId, 'finalizing', `No text to translate, preserving original...`, 95);
+    return content; // Return original content if no text lines
+  }
   
   const uniqueLines = [...new Set(textLines)];
   console.log(`Reduced to ${uniqueLines.length} unique lines for translation`);
@@ -360,7 +391,93 @@ async function translateSubtitle(content, processId, targetLang) {
     text: block.text.map(line => translationMap.get(line) || line)
   }));
   
-  return reconstructSubtitle(translatedBlocks);
+  // Reconstruct in appropriate format
+  if (isVTT) {
+    return reconstructVTT(translatedBlocks);
+  } else {
+    return reconstructSubtitle(translatedBlocks);
+  }
+}
+
+// Add VTT parsing function
+function parseVTTContent(content) {
+  const blocks = [];
+  const lines = content.split('\n');
+  let currentBlock = null;
+  let inHeader = true;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    
+    // Skip the WEBVTT header and any metadata
+    if (inHeader) {
+      if (line === '' || i > 10) { // After header or after some lines
+        inHeader = false;
+      }
+      continue;
+    }
+    
+    // Skip empty lines between blocks
+    if (!line) {
+      if (currentBlock) {
+        blocks.push(currentBlock);
+        currentBlock = null;
+      }
+      continue;
+    }
+    
+    // Time line (VTT format: 00:00:01.000 --> 00:00:03.000)
+    if (line.includes('-->')) {
+      currentBlock = { time: line, text: [] };
+      continue;
+    }
+    
+    // Text line
+    if (currentBlock && currentBlock.time) {
+      // Skip cue identifiers (optional numbers or text before time)
+      if (!/^\d+$/.test(line) && !line.includes('-->')) {
+        currentBlock.text.push(line);
+      }
+    }
+  }
+  
+  // Push the last block if exists
+  if (currentBlock) {
+    blocks.push(currentBlock);
+  }
+  
+  // Add block numbers for reconstruction
+  blocks.forEach((block, index) => {
+    block.number = index + 1;
+  });
+  
+  return blocks;
+}
+
+// Add VTT reconstruction function
+function reconstructVTT(blocks) {
+  let vtt = 'WEBVTT\n\n';
+  
+  blocks.forEach(block => {
+    vtt += `${block.time}\n`;
+    vtt += block.text.join('\n');
+    vtt += '\n\n';
+  });
+  
+  return vtt.trim();
+}
+
+// Also update your srtToVtt function to handle already-VTT content
+function srtToVtt(srtContent) {
+  // Check if already VTT
+  if (srtContent.trim().startsWith('WEBVTT')) {
+    console.log('Content is already in VTT format, returning as-is');
+    return srtContent;
+  }
+  
+  let vtt = 'WEBVTT\n\n';
+  vtt += srtContent.replace(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/g, '$1:$2:$3.$4');
+  return vtt;
 }
 
 async function fetchImdbId(tmdbId, type) {
@@ -376,66 +493,58 @@ async function fetchImdbId(tmdbId, type) {
   }
 }
 
-// Improved Febbox subtitle fetcher
-async function getFebbox(media) {
-  const DOMAIN = `https://fed-subs.pstream.mov/`;
-
-  let url;
-  if (media.type === 'movie') {
-    url = `${DOMAIN}movie/${media.imdb}`;
-  } else {
-    url = `${DOMAIN}tv/${media.imdb}/${media.season}/${media.episode}`;
-  }
-
+// Use vidlink.js module for subtitle fetching instead of Febbox
+async function getSubtitleFromVidlink(tmdbId, type, season = null, episode = null, imdbId = null) {
+  console.log(`[Vidlink] Fetching subtitles for TMDB: ${tmdbId}, Type: ${type}${type === 'tv' ? `, S:${season}E:${episode}` : ''}`);
+  
   try {
-    console.log(`Trying Febbox: ${url}`);
-    const request = await fetch(url);
+    // Use the getSubtitles function from vidlink module
+    const subtitles = await vidlinkModule.getSubtitles(tmdbId, type, season, episode);
     
-    if (!request.ok) {
-      throw new Error(`Febbox API error: ${request.status}`);
+    if (!subtitles || subtitles.length === 0) {
+      throw new Error('No subtitles found from Vidlink');
     }
-
-    const subs_with_dif_format = await request.json();
-    const subs = subs_with_dif_format.subtitles || {};
-
-    // Transform to array of { url, lang, type }
-    const subtitles = Object.entries(subs).map(([language, sub]) => {
-      const langCode = LANGUAGE_MAP[language.toLowerCase()] || language;
-      const extMatch = sub.subtitle_link?.match(/\.(\w+)$/);
-      const type = extMatch ? extMatch[1] : 'srt';
-      return {
-        url: sub.subtitle_link,
-        lang: langCode,
-        type
-      };
-    });
-
+    
+    console.log(`[Vidlink] Found ${subtitles.length} subtitles`);
+    
     // Find English subtitle first, then any available
-    const englishSub = subtitles.find(sub => sub.lang === 'en');
+    const englishSub = subtitles.find(sub => {
+      const langCode = sub.lang || '';
+      return langCode.toLowerCase() === 'en' || 
+             langCode.toLowerCase() === 'english' ||
+             (sub.language && sub.language.toLowerCase().includes('english'));
+    });
+    
     const selectedSub = englishSub || subtitles[0];
-
+    
     if (!selectedSub) {
-      throw new Error('No subtitles found on Febbox');
+      throw new Error('No valid subtitle found');
     }
-
-    console.log(`Found Febbox subtitle: ${selectedSub.lang} - ${selectedSub.url}`);
+    
+    console.log(`[Vidlink] Selected subtitle: ${selectedSub.language || selectedSub.lang} - ${selectedSub.url}`);
     
     return {
       success: true,
-      subtitle: selectedSub,
-      source: 'febbox'
+      subtitle: {
+        url: selectedSub.url,
+        lang: selectedSub.lang || 'en',
+        language: selectedSub.language || 'English',
+        type: selectedSub.type || 'srt'
+      },
+      source: 'vidlink'
     };
+    
   } catch (error) {
-    console.error('Febbox failed:', error.message);
+    console.error('[Vidlink] Failed:', error.message);
     return {
       success: false,
       error: error.message,
-      source: 'febbox'
+      source: 'vidlink'
     };
   }
 }
 
-// Improved LibreSubs subtitle fetcher
+// Improved LibreSubs subtitle fetcher (as fallback)
 async function getLibre(media) {
   const DOMAIN = `https://libre-subs.fifthwit.net/search?id=${media.tmdb}`;
 
@@ -487,54 +596,6 @@ async function getLibre(media) {
   }
 }
 
-// Improved Wyzie subtitle fetcher
-async function getWyzie(media) {
-  try {
-    const wyzieLib = await import('wyzie-lib');
-    const { searchSubtitles } = wyzieLib;
-    
-    const searchParams = {
-      tmdb_id: media.tmdb,
-      imdb_id: media.imdb,
-      season: media.season,
-      episode: media.episode,
-      format: 'srt'
-    };
-    
-    console.log('Searching Wyzie for subtitles with parameters:', searchParams);
-    const subtitlesWithNerdyAmountOfInformation = await searchSubtitles(searchParams);
-    
-    if (!subtitlesWithNerdyAmountOfInformation || !subtitlesWithNerdyAmountOfInformation.length) {
-      throw new Error('No subtitles found on Wyzie');
-    }
-
-    const subtitles = subtitlesWithNerdyAmountOfInformation.map((sub) => ({
-      url: sub.url,
-      lang: sub.language,
-      type: sub.format
-    }));
-
-    // Find English subtitle first, then any available
-    const englishSub = subtitles.find(sub => sub.lang === 'en');
-    const selectedSub = englishSub || subtitles[0];
-
-    console.log(`Found Wyzie subtitle: ${selectedSub.lang} - ${selectedSub.url}`);
-    
-    return {
-      success: true,
-      subtitle: selectedSub,
-      source: 'wyzie'
-    };
-  } catch (error) {
-    console.error('Wyzie failed:', error.message);
-    return {
-      success: false,
-      error: error.message,
-      source: 'wyzie'
-    };
-  }
-}
-
 // Enhanced subtitle fetcher with multiple sources and English priority
 async function getSubtitleFromSources(tmdbId, type, season = null, episode = null, imdbId = null) {
   const media = {
@@ -546,15 +607,14 @@ async function getSubtitleFromSources(tmdbId, type, season = null, episode = nul
   };
 
   const sources = [
-    { name: 'Febbox', fetcher: getFebbox },
-    { name: 'Wyzie', fetcher: getWyzie },
+    { name: 'Vidlink', fetcher: getSubtitleFromVidlink },
     { name: 'LibreSubs', fetcher: getLibre }
   ];
 
   for (const source of sources) {
     try {
       console.log(`Trying ${source.name}...`);
-      const result = await source.fetcher(media);
+      const result = await source.fetcher(tmdbId, type, season, episode, imdbId);
       
       if (result.success) {
         console.log(`✅ ${source.name} succeeded with ${result.subtitle.lang} subtitle`);
@@ -672,7 +732,7 @@ async function fetchAndTranslateSubtitle(tmdbId, type, season = null, episode = 
   console.log(`Fetched IMDb ID: ${imdbId}`);
   
   try {
-    updateProcessStatus(processId, 'searching_subs', 'Searching across multiple subtitle sources...', 20);
+    updateProcessStatus(processId, 'searching_subs', 'Searching across subtitle sources...', 20);
     
     const subtitleResult = await getSubtitleFromSources(tmdbId, type, season, episode, imdbId);
     
@@ -712,7 +772,7 @@ async function fetchAndTranslateSubtitle(tmdbId, type, season = null, episode = 
     return { 
       success: false, 
       error: err.message,
-      sourcesTried: ['febbox', 'wyzie', 'libresubs'],
+      sourcesTried: ['vidlink', 'libresubs'],
       language: language
     };
   }
@@ -1488,7 +1548,7 @@ app.get('/', (req, res) => {
                 <div class="stat-label">LANGUAGES SUPPORTED</div>
             </div>
             <div class="stat-card">
-                <div class="stat-number">3</div>
+                <div class="stat-number">2</div>
                 <div class="stat-label">SUBTITLE SOURCES</div>
             </div>
             <div class="stat-card">
@@ -1510,7 +1570,7 @@ app.get('/', (req, res) => {
                 <div class="terminal-line"><span class="output">✓ Multi-language translation engine: ONLINE</span></div>
                 <div class="terminal-line"><span class="output">✓ Smart caching system: ACTIVE</span></div>
                 <div class="terminal-line"><span class="output">✓ Instant cache delivery: ENABLED</span></div>
-                <div class="terminal-line"><span class="output">✓ Triple subtitle sources: FEBBOX + WYZIE + LIBRESUBS</span></div>
+                <div class="terminal-line"><span class="output">✓ Dual subtitle sources: VIDLINK + LIBRESUBS</span></div>
                 <div class="terminal-line"><span class="output">✓ Language support: ${totalLanguages} LANGUAGES</span></div>
                 <div class="terminal-line"><span class="output">✓ Timing preservation: PERFECT SYNC GUARANTEED</span></div>
                 <div class="terminal-line"><span class="output">✓ English priority: ALWAYS FETCH ENGLISH FIRST</span></div>
@@ -2023,8 +2083,8 @@ async function pollForSubtitle(processId) {
                 </div>
                 <div class="feature">
                     <i class="fas fa-database"></i>
-                    <h3>Triple Sources</h3>
-                    <p>Febbox primary + Wyzie secondary + LibreSubs fallback for maximum reliability</p>
+                    <h3>Dual Sources</h3>
+                    <p>Vidlink primary + LibreSubs fallback for maximum reliability</p>
                 </div>
                 <div class="feature">
                     <i class="fas fa-code"></i>
@@ -2059,8 +2119,8 @@ async function pollForSubtitle(processId) {
                 </div>
                 <div class="feature">
                     <i class="fas fa-source"></i>
-                    <h3>Triple Source Fallback</h3>
-                    <p>Febbox, Wyzie, and LibreSubs for maximum subtitle availability</p>
+                    <h3>Vidlink Integration</h3>
+                    <p>Now using Vidlink as primary subtitle source for better availability</p>
                 </div>
                 <div class="feature">
                     <i class="fas fa-bolt"></i>
@@ -2202,7 +2262,7 @@ app.listen(PORT, () => {
   console.log(`║  PORT: ${PORT}                                               ║`);
   console.log(`║  DOMAIN: ${DOMAIN}                                           ║`);
   console.log(`║  LANGUAGES: ${totalLanguages} SUPPORTED                      ║`);
-  console.log(`║  SOURCES: FEBBOX + WYZIE + LIBRESUBS                        ║`);
+  console.log(`║  SOURCES: VIDLINK + LIBRESUBS                               ║`);
   console.log(`║  STATUS: REAL-TIME TRACKING ACTIVE                          ║`);
   console.log(`║  TIMING: PERFECT SYNC PRESERVATION                          ║`);
   console.log(`║  CONCURRENT: MULTI-REQUEST HANDLING                         ║`);
